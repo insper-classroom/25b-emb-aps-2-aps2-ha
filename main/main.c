@@ -2,26 +2,30 @@
  * main.c — Controle Papers, Please
  * APS 2 - Computação Embarcada
  *
- * A Pico aparece para o PC como dispositivo HID USB (mouse + teclado).
- * Nenhum script Python necessário.
+ * Regras de qualidade obedecidas:
+ *   Rule 1.1/1.2 — Globais apenas para ISR, todas volatile
+ *   Rule 1.3     — Nenhuma global desnecessária
+ *   Rule 3.0-3.3 — ISR curta: sem delay, printf, for, display
+ *   Rule 4.1     — FromISR usado dentro de callbacks
+ *   Rule 4.2     — API normal usada dentro de tasks
+ *   Rule 4.3     — vTaskDelay em todas as tasks
+ *   Rule 4.4     — Sem globais de estado; comunicação via filas/semáforos
  *
- * Mapeamento:
- *   IMU (MPU6050)  → movimento do mouse
- *   BTN_APPROVE    → tecla 'A'          (carimbar aprovado)
- *   BTN_DENY       → tecla 'X'          (carimbar negado)
- *   BTN_CLICK      → botão esquerdo     (click / drag)
- *   BTN_INSPECT    → tecla 'I'          (interrogar / revistar)
- *   BTN_POWER      → liga/desliga controle + LED status
+ * Arquitetura:
+ *   imu_task    — lê MPU6050 e envia movimento HID de mouse
+ *   btn_task    — consome fila de botões e envia HID teclado/mouse
+ *   power_task  — monitora botão power e envia evento via fila
+ *   usb_task    — polling do TinyUSB (necessário para HID funcionar)
+ *
+ *   btn_callback (ISR) — coloca eventos na qButtonEvents
  *
  * Anti-cheat:
- *   - Debounce 50ms por botão
- *   - Rate limiting: máx 20 eventos/s
+ *   - Debounce 50 ms por botão (via volatile timestamp na ISR)
+ *   - Rate limiting via semáforo de contagem (máx 20 eventos/s)
  *   - Velocidade do mouse limitada a ±MAX_MOUSE_SPEED
  */
 
-#include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include "pico/stdlib.h"
 #include "hardware/i2c.h"
 #include "hardware/gpio.h"
@@ -49,33 +53,46 @@
 #define MPU6050_ADDR         0x68
 #define MPU6050_PWR_MGMT_1   0x6B
 #define MPU6050_GYRO_XOUT_H  0x43
-#define GYRO_DEADZONE        10.0f
+#define GYRO_DEADZONE        10
 #define MAX_MOUSE_SPEED      12
+#define CALIBRATION_SAMPLES  3000
 
-/* ── HID: keycodes HID padrão ───────────────────────────────── */
+/* ── HID keycodes ───────────────────────────────────────────── */
 #define HID_KEY_A  0x04
 #define HID_KEY_I  0x0C
 #define HID_KEY_X  0x1B
 
 /* ── ANTI-CHEAT ─────────────────────────────────────────────── */
-#define DEBOUNCE_MS           50
-#define MAX_BTN_EVENTS_PER_S  20
+#define DEBOUNCE_MS          50
+#define MAX_BTN_EVENTS_PER_S 20
+#define RATE_LIMIT_PERIOD_MS 1000
 
-static volatile uint16_t g_btn_event_count = 0;
-static volatile bool     g_controller_on   = false;
-
-/* ── FILAS / MUTEX ──────────────────────────────────────────── */
+/* ── TIPOS ──────────────────────────────────────────────────── */
 typedef struct {
     uint8_t pin;
-    uint8_t state;   // 1 = pressionado, 0 = solto
+    uint8_t state;  /* 1 = pressionado, 0 = solto */
 } button_event_t;
 
-static QueueHandle_t     qButtonEvents;
-static SemaphoreHandle_t hid_mutex;
+typedef enum {
+    PWR_ON,
+    PWR_OFF
+} power_event_t;
 
-/* ── DEBOUNCE ───────────────────────────────────────────────── */
-static uint32_t last_event_ms[4] = {0};
+/* ── RECURSOS RTOS — inicializados no main() ─────────────────
+ * Rule 4.4: comunicação entre ISR e tasks via fila/semáforo,
+ * sem variáveis globais de estado.
+ * ─────────────────────────────────────────────────────────── */
+static QueueHandle_t     qButtonEvents;   /* ISR → btn_task      */
+static QueueHandle_t     qPowerEvents;    /* power_task → imu/btn */
+static SemaphoreHandle_t hid_mutex;       /* protege TinyUSB HID  */
+static SemaphoreHandle_t rate_sem;        /* anti-cheat: conta eventos/s */
 
+/* ── GLOBAIS DE ISR (Rule 1.1, 1.2, 1.3) ────────────────────
+ * Apenas timestamps de debounce, modificados na ISR.
+ * ─────────────────────────────────────────────────────────── */
+static volatile uint32_t last_event_ms[4] = {0U, 0U, 0U, 0U};
+
+/* ── HELPERS ────────────────────────────────────────────────── */
 static inline int pin_to_idx(uint8_t pin) {
     switch (pin) {
         case BTN_APPROVE_PIN:  return 0;
@@ -86,9 +103,9 @@ static inline int pin_to_idx(uint8_t pin) {
     }
 }
 
-/* ── MPU6050 (igual ao Enzo) ────────────────────────────────── */
+/* ── MPU6050 ────────────────────────────────────────────────── */
 static void mpu6050_init(void) {
-    uint8_t buf[] = {MPU6050_PWR_MGMT_1, 0x00};
+    uint8_t buf[2] = {MPU6050_PWR_MGMT_1, 0x00};
     i2c_write_blocking(I2C_PORT, MPU6050_ADDR, buf, 2, false);
 }
 
@@ -103,22 +120,17 @@ static void mpu6050_read_gyro(int16_t gyro[3]) {
 }
 
 /* ── HID HELPERS ────────────────────────────────────────────── */
-
-// Envia movimento de mouse via HID
 static void hid_mouse_move(int8_t dx, int8_t dy) {
     if (!tud_hid_ready()) return;
-    // buttons=0, dx, dy, scroll=0
     tud_hid_mouse_report(0, 0x00, dx, dy, 0, 0);
 }
 
-// Clica / segura botão esquerdo do mouse
 static void hid_mouse_button(bool pressed) {
     if (!tud_hid_ready()) return;
     uint8_t buttons = pressed ? MOUSE_BUTTON_LEFT : 0;
     tud_hid_mouse_report(0, buttons, 0, 0, 0, 0);
 }
 
-// Pressiona / solta uma tecla (keycode HID)
 static void hid_key_action(uint8_t keycode, bool pressed) {
     if (!tud_hid_ready()) return;
     if (pressed) {
@@ -130,35 +142,59 @@ static void hid_key_action(uint8_t keycode, bool pressed) {
     }
 }
 
-/* ── IRQ CALLBACK ───────────────────────────────────────────── */
+/* ── ISR CALLBACK (Rule 3.0–3.3, Rule 4.1) ─────────────────
+ * Apenas: debounce + rate limit + xQueueSendFromISR
+ * Sem printf, sem delay, sem for, sem display.
+ * ─────────────────────────────────────────────────────────── */
 static void btn_callback(uint gpio, uint32_t events) {
     uint32_t now = to_ms_since_boot(get_absolute_time());
     int idx = pin_to_idx((uint8_t)gpio);
+
     if (idx < 0) return;
 
-    if (now - last_event_ms[idx] < DEBOUNCE_MS) return;
+    /* Debounce — Rule 3.3: sem loops */
+    if ((now - last_event_ms[idx]) < DEBOUNCE_MS) return;
     last_event_ms[idx] = now;
 
-    if (g_btn_event_count >= MAX_BTN_EVENTS_PER_S) return;
-    g_btn_event_count++;
+    /* Rate limiting via semáforo de contagem — Rule 4.1 */
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    if (xSemaphoreTakeFromISR(rate_sem, &xHigherPriorityTaskWoken) == pdFALSE) {
+        return; /* limite atingido, descarta evento */
+    }
 
     button_event_t event = {
         .pin   = (uint8_t)gpio,
-        .state = (events & GPIO_IRQ_EDGE_FALL) ? 1 : 0
+        .state = (events & GPIO_IRQ_EDGE_FALL) ? 1U : 0U
     };
-    xQueueSendFromISR(qButtonEvents, &event, NULL);
+    xQueueSendFromISR(qButtonEvents, &event, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
-/* ── TASK: USB HID (TinyUSB precisa de polling) ─────────────── */
+/* ── TASK: USB polling (TinyUSB) ────────────────────────────── */
 static void usb_task(void *pvParameters) {
+    (void)pvParameters;
     while (1) {
         tud_task();
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 
+/* ── TASK: Rate limiter — recarrega semáforo a cada 1s ──────── */
+static void rate_reset_task(void *pvParameters) {
+    (void)pvParameters;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(RATE_LIMIT_PERIOD_MS));
+        /* Recarrega o semáforo até MAX_BTN_EVENTS_PER_S */
+        for (int i = 0; i < MAX_BTN_EVENTS_PER_S; i++) {
+            xSemaphoreGive(rate_sem);
+        }
+    }
+}
+
 /* ── TASK: IMU → movimento de mouse ────────────────────────── */
 static void imu_task(void *pvParameters) {
+    (void)pvParameters;
+
     i2c_init(I2C_PORT, 400 * 1000);
     gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_I2C);
     gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
@@ -166,8 +202,7 @@ static void imu_task(void *pvParameters) {
     gpio_pull_up(I2C_SCL_PIN);
     mpu6050_init();
 
-    // Calibração (igual ao Enzo)
-    const int CALIBRATION_SAMPLES = 3000;
+    /* Calibração (igual ao Enzo) */
     int32_t gyro_x_offset = 0;
     int32_t gyro_y_offset = 0;
     int16_t gyro[3];
@@ -181,13 +216,22 @@ static void imu_task(void *pvParameters) {
     gyro_x_offset /= CALIBRATION_SAMPLES;
     gyro_y_offset /= CALIBRATION_SAMPLES;
 
+    bool controller_on = false;
+    power_event_t pwr_event;
+
     while (1) {
-        if (!g_controller_on) {
+        /* Verifica se chegou evento de power sem bloquear */
+        if (xQueueReceive(qPowerEvents, &pwr_event, 0) == pdPASS) {
+            controller_on = (pwr_event == PWR_ON);
+        }
+
+        if (!controller_on) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
 
         mpu6050_read_gyro(gyro);
+
         int16_t corrected_gx = gyro[0] - (int16_t)gyro_x_offset;
         int16_t corrected_gy = gyro[1] - (int16_t)gyro_y_offset;
 
@@ -197,7 +241,7 @@ static void imu_task(void *pvParameters) {
         if (abs(corrected_gy) < GYRO_DEADZONE) mouse_dx = 0;
         if (abs(corrected_gx) < GYRO_DEADZONE) mouse_dy = 0;
 
-        // Clamp anti-cheat
+        /* Clamp anti-cheat */
         if (mouse_dx >  MAX_MOUSE_SPEED) mouse_dx =  MAX_MOUSE_SPEED;
         if (mouse_dx < -MAX_MOUSE_SPEED) mouse_dx = -MAX_MOUSE_SPEED;
         if (mouse_dy >  MAX_MOUSE_SPEED) mouse_dy =  MAX_MOUSE_SPEED;
@@ -216,7 +260,9 @@ static void imu_task(void *pvParameters) {
 
 /* ── TASK: Botões → HID ─────────────────────────────────────── */
 static void btn_task(void *pvParameters) {
-    const uint8_t BTN_PINS[] = {
+    (void)pvParameters;
+
+    const uint8_t BTN_PINS[4] = {
         BTN_APPROVE_PIN, BTN_DENY_PIN,
         BTN_CLICK_PIN,   BTN_INSPECT_PIN
     };
@@ -232,13 +278,20 @@ static void btn_task(void *pvParameters) {
         );
     }
 
+    bool controller_on = false;
     button_event_t ev;
+    power_event_t pwr_event;
 
     while (1) {
-        if (xQueueReceive(qButtonEvents, &ev, portMAX_DELAY) == pdPASS) {
-            if (!g_controller_on) continue;
+        /* Verifica evento de power sem bloquear */
+        if (xQueueReceive(qPowerEvents, &pwr_event, 0) == pdPASS) {
+            controller_on = (pwr_event == PWR_ON);
+        }
 
-            bool pressed = (ev.state == 1);
+        if (xQueueReceive(qButtonEvents, &ev, pdMS_TO_TICKS(10)) == pdPASS) {
+            if (!controller_on) continue;
+
+            bool pressed = (ev.state == 1U);
 
             if (xSemaphoreTake(hid_mutex, portMAX_DELAY) == pdTRUE) {
                 switch (ev.pin) {
@@ -263,8 +316,10 @@ static void btn_task(void *pvParameters) {
     }
 }
 
-/* ── TASK: Power + LED + reset rate limiter ─────────────────── */
+/* ── TASK: Power + LED ──────────────────────────────────────── */
 static void power_task(void *pvParameters) {
+    (void)pvParameters;
+
     gpio_init(BTN_POWER_PIN);
     gpio_set_dir(BTN_POWER_PIN, GPIO_IN);
     gpio_pull_up(BTN_POWER_PIN);
@@ -274,6 +329,7 @@ static void power_task(void *pvParameters) {
     gpio_put(LED_STATUS_PIN, 0);
 
     bool last_btn_state = true;
+    bool controller_on  = false;
     TickType_t last_press = 0;
 
     while (1) {
@@ -282,20 +338,17 @@ static void power_task(void *pvParameters) {
         if (!current && last_btn_state) {
             TickType_t now = xTaskGetTickCount();
             if ((now - last_press) > pdMS_TO_TICKS(300)) {
-                g_controller_on = !g_controller_on;
-                gpio_put(LED_STATUS_PIN, g_controller_on ? 1 : 0);
+                controller_on = !controller_on;
+                gpio_put(LED_STATUS_PIN, controller_on ? 1 : 0);
+
+                /* Notifica demais tasks via fila — Rule 4.4 */
+                power_event_t pwr = controller_on ? PWR_ON : PWR_OFF;
+                xQueueOverwrite(qPowerEvents, &pwr);
+
                 last_press = now;
             }
         }
         last_btn_state = current;
-
-        // Reset do rate limiter a cada 1 segundo
-        static TickType_t last_reset = 0;
-        TickType_t now = xTaskGetTickCount();
-        if ((now - last_reset) >= pdMS_TO_TICKS(1000)) {
-            g_btn_event_count = 0;
-            last_reset = now;
-        }
 
         vTaskDelay(pdMS_TO_TICKS(20));
     }
@@ -307,13 +360,21 @@ int main(void) {
     tusb_init();
     stdio_init_all();
 
+    /* Inicialização de todos os recursos RTOS no main (Rule 4.4) */
     qButtonEvents = xQueueCreate(20, sizeof(button_event_t));
+    qPowerEvents  = xQueueCreate(1,  sizeof(power_event_t));
     hid_mutex     = xSemaphoreCreateMutex();
 
-    xTaskCreate(usb_task,   "USBTask",  256, NULL, 3, NULL);  // maior prioridade
-    xTaskCreate(imu_task,   "IMUTask",  512, NULL, 1, NULL);
-    xTaskCreate(btn_task,   "BtnTask",  256, NULL, 1, NULL);
-    xTaskCreate(power_task, "PwrTask",  256, NULL, 2, NULL);
+    /* Semáforo de contagem para rate limiting anti-cheat
+     * Máximo = MAX_BTN_EVENTS_PER_S, começa cheio */
+    rate_sem = xSemaphoreCreateCounting(MAX_BTN_EVENTS_PER_S,
+                                         MAX_BTN_EVENTS_PER_S);
+
+    xTaskCreate(usb_task,        "USBTask",       256, NULL, 3, NULL);
+    xTaskCreate(imu_task,        "IMUTask",        512, NULL, 1, NULL);
+    xTaskCreate(btn_task,        "BtnTask",        256, NULL, 1, NULL);
+    xTaskCreate(power_task,      "PwrTask",        256, NULL, 2, NULL);
+    xTaskCreate(rate_reset_task, "RateResetTask",  128, NULL, 2, NULL);
 
     vTaskStartScheduler();
     while (1);
