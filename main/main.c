@@ -1,392 +1,468 @@
 /*
  * main.c — Controle Papers, Please
- * APS 2 - Computação Embarcada
+ * APS 2 + Expert (IA + RTOS) | Computação Embarcada — Insper
  *
- * Regras de qualidade obedecidas:
- *   Rule 1.1/1.2/1.3 — Zero globais: nem de estado nem de ISR
- *   Rule 3.0-3.3      — ISR curta: sem delay, printf, for, display
- *   Rule 4.1          — FromISR usado dentro de callbacks
- *   Rule 4.2          — API normal usada dentro de tasks
- *   Rule 4.3          — vTaskDelay em todas as tasks
- *   Rule 4.4          — Toda comunicacao via filas/semaforos RTOS
+ * Arquitetura de tasks:
+ *   init_task        (prio 4) — inicializa IMU e periféricos; se auto-deleta
+ *   tx_task          (prio 3) — consome xQueueTX e escreve na USB-UART
+ *   power_task       (prio 2) — polling do BTN_POWER; atualiza LED; envia PWR,n
+ *   rate_reset_task  (prio 2) — recarrega xSemRate 1x/s
+ *   imu_task         (prio 1) — lê MPU6050 ~100 Hz; enfileira M,dx,dy e janelas p/ IA
+ *   ia_task          (prio 1) — roda inferência Edge Impulse; imprime classe
+ *   btn_task         (prio 1) — debounce dos botões; enfileira BD/BU,n
  *
- * Debounce sem global:
- *   O timestamp e incluido no proprio evento (button_event_t.time_ms).
- *   A btn_task compara timestamps por pino e descarta bounces.
+ * Protocolo USB-UART (115200, ASCII, \n):
+ *   M,dx,dy\n   — movimento do mouse  (dx/dy clampados em ±12)
+ *   BD,n\n      — button down
+ *   BU,n\n      — button up
+ *   PWR,1\n     — controle ligado
+ *   PWR,0\n     — controle desligado
  *
- * Anti-cheat:
- *   - Debounce 50 ms filtrado na task
- *   - Rate limiting via semaforo de contagem (max 20 eventos/s)
- *   - Velocidade do mouse limitada a MAX_MOUSE_SPEED
+ * NOTA sobre IA:
+ *   Este arquivo assume que o modelo Edge Impulse foi exportado como
+ *   "C++ Library" e integrado ao projeto (pastas edge-impulse-sdk,
+ *   model-parameters, tflite-model). O header ei_run_classifier.h e
+ *   a struct ei_impulse_result_t são fornecidos pela biblioteca gerada.
+ *   Siga o repositório: https://github.com/insper-embarcados/edgeimpulse-runner
  */
 
-#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+
 #include "pico/stdlib.h"
-#include "hardware/i2c.h"
 #include "hardware/gpio.h"
-#include "bsp/board.h"
-#include "tusb.h"
+#include "hardware/i2c.h"
 
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
 #include "semphr.h"
 
-/* ── PINOS ──────────────────────────────────────────────────── */
-#define I2C_PORT     i2c0
-#define I2C_SDA_PIN  4
-#define I2C_SCL_PIN  5
+/* ── Edge Impulse ───────────────────────────────────────────────────────────
+ * Inclua os headers gerados pelo export do Edge Impulse.
+ * Se o modelo ainda não foi treinado, deixe IA_ENABLED 0 para compilar
+ * sem a biblioteca e testar o restante do firmware.
+ * ────────────────────────────────────────────────────────────────────────── */
+#define IA_ENABLED 0   /* mude para 1 após integrar a lib do Edge Impulse */
 
-#define BTN_APPROVE_PIN  16
-#define BTN_DENY_PIN     17
-#define BTN_CLICK_PIN    18
-#define BTN_INSPECT_PIN  19
-#define BTN_POWER_PIN    20
-#define LED_STATUS_PIN   25
+#if IA_ENABLED
+#include "edge-impulse-sdk/classifier/ei_run_classifier.h"
+#endif
 
-/* ── MPU6050 ────────────────────────────────────────────────── */
-#define MPU6050_ADDR         0x68
-#define MPU6050_PWR_MGMT_1   0x6B
-#define MPU6050_GYRO_XOUT_H  0x43
-#define GYRO_DEADZONE        10
-#define MAX_MOUSE_SPEED      12
-#define CALIBRATION_SAMPLES  3000
+/* ── Pinos ──────────────────────────────────────────────────────────────── */
+#define BTN_APPROVE   13
+#define BTN_DENY      15
+#define BTN_CLICK     14
+#define BTN_INSPECT   12
+#define BTN_POWER     11
 
-/* ── HID keycodes ───────────────────────────────────────────── */
-#define HID_KEY_A  0x04
-#define HID_KEY_I  0x0C
-#define HID_KEY_X  0x1B
+#define LED_STATUS    17   /* aceso = controle ligado */
+#define LED_CALIBRADO 16   /* pisca durante calibração */
 
-/* ── ANTI-CHEAT ─────────────────────────────────────────────── */
-#define DEBOUNCE_MS          50
-#define MAX_BTN_EVENTS_PER_S 20
-#define RATE_LIMIT_PERIOD_MS 1000
-#define NUM_BTNS             4
+/* LEDs de feedback da IA (podem ser o mesmo LED RGB ou 3 pinos distintos) */
+#define LED_IA_IDLE   20
+#define LED_IA_UPDOWN 21
+#define LED_IA_WAVE   22
 
-/* ── TIPOS ──────────────────────────────────────────────────── */
+#define I2C_PORT  i2c0
+#define I2C_SDA   8
+#define I2C_SCL   9
+#define MPU_ADDR  0x68
+
+/* ── Parâmetros ─────────────────────────────────────────────────────────── */
+#define CALIB_SAMPLES     200
+#define MOUSE_SCALE       12        /* divisor do giroscópio → pixels         */
+#define MOUSE_CLAMP       12        /* máximo ±px por evento                  */
+#define RATE_LIMIT_HZ     20        /* máx. eventos de botão por segundo       */
+
+/* Janela de amostras para a IA (deve casar com o impulse do Edge Impulse)   */
+#define IA_WINDOW_SIZE    50        /* ~500 ms a 100 Hz                        */
+#define IA_N_AXES         3         /* ax, ay, az                              */
+
+/* ── Tipos ──────────────────────────────────────────────────────────────── */
 typedef struct {
-    uint8_t  pin;
-    uint8_t  state;      /* 1 = pressionado, 0 = solto */
-    uint32_t time_ms;    /* timestamp da ISR — debounce feito na task */
-} button_event_t;
+    uint8_t pin;
+    bool    pressed;   /* true = pressionado */
+    uint32_t ts_ms;
+} btn_event_t;
 
-typedef enum {
-    PWR_ON,
-    PWR_OFF
-} power_event_t;
+typedef struct {
+    float ax, ay, az;
+} imu_sample_t;
 
-/* ── RECURSOS RTOS — inicializados no main() ─────────────────
- * Rule 4.4: zero globais de estado; comunicacao via RTOS.
- * QueueHandle e SemaphoreHandle sao recursos do RTOS, permitidos.
- * ─────────────────────────────────────────────────────────── */
-static QueueHandle_t     qButtonEvents;
-static QueueHandle_t     qPowerEvents;
-static SemaphoreHandle_t hid_mutex;
-static SemaphoreHandle_t rate_sem;
+/* ── Filas e semáforos ──────────────────────────────────────────────────── */
+static QueueHandle_t xQueueButtons;   /* ISR  → btn_task  */
+static QueueHandle_t xQueueTX;        /* *    → tx_task   */
+static QueueHandle_t xQueuePower;     /* power_task → imu/btn/ia */
+static QueueHandle_t xQueueIMU;       /* imu_task → ia_task */
+static SemaphoreHandle_t xSemRate;    /* rate limiting de botões */
 
-/* ── HELPERS ────────────────────────────────────────────────── */
-static inline int pin_to_idx(uint8_t pin) {
-    switch (pin) {
-        case BTN_APPROVE_PIN:  return 0;
-        case BTN_DENY_PIN:     return 1;
-        case BTN_CLICK_PIN:    return 2;
-        case BTN_INSPECT_PIN:  return 3;
-        default:               return -1;
-    }
+/* ── Estado global da IMU (offsets de calibração) ───────────────────────── */
+static volatile int32_t gyro_off_x = 0;
+static volatile int32_t gyro_off_y = 0;
+static volatile int32_t gyro_off_z = 0;
+
+/* ── Helpers MPU6050 ────────────────────────────────────────────────────── */
+static void mpu_write(uint8_t reg, uint8_t val) {
+    uint8_t buf[2] = {reg, val};
+    i2c_write_blocking(I2C_PORT, MPU_ADDR, buf, 2, false);
 }
 
-/* ── MPU6050 ────────────────────────────────────────────────── */
-static void mpu6050_init(void) {
-    uint8_t buf[2] = {MPU6050_PWR_MGMT_1, 0x00};
-    i2c_write_blocking(I2C_PORT, MPU6050_ADDR, buf, 2, false);
+static void mpu_read(uint8_t reg, uint8_t *buf, uint8_t len) {
+    i2c_write_blocking(I2C_PORT, MPU_ADDR, &reg, 1, true);
+    i2c_read_blocking(I2C_PORT, MPU_ADDR, buf, len, false);
 }
 
-static void mpu6050_read_gyro(int16_t gyro[3]) {
-    uint8_t buffer[6];
-    uint8_t reg = MPU6050_GYRO_XOUT_H;
-    i2c_write_blocking(I2C_PORT, MPU6050_ADDR, &reg, 1, true);
-    i2c_read_blocking(I2C_PORT, MPU6050_ADDR, buffer, 6, false);
-    gyro[0] = (int16_t)((buffer[0] << 8) | buffer[1]);
-    gyro[1] = (int16_t)((buffer[2] << 8) | buffer[3]);
-    gyro[2] = (int16_t)((buffer[4] << 8) | buffer[5]);
+static void mpu_init(void) {
+    mpu_write(0x6B, 0x00);  /* sai do sleep */
+    mpu_write(0x1C, 0x00);  /* accel ±2g    */
+    mpu_write(0x1B, 0x00);  /* gyro ±250°/s */
 }
 
-/* ── HID HELPERS ────────────────────────────────────────────── */
-static void hid_mouse_move(int8_t dx, int8_t dy) {
-    if (!tud_hid_ready()) return;
-    tud_hid_mouse_report(0, 0x00, dx, dy, 0, 0);
+/* Lê aceleração bruta (registradores 0x3B–0x40) */
+static void mpu_read_accel(int16_t *ax, int16_t *ay, int16_t *az) {
+    uint8_t buf[6];
+    mpu_read(0x3B, buf, 6);
+    *ax = (int16_t)((buf[0] << 8) | buf[1]);
+    *ay = (int16_t)((buf[2] << 8) | buf[3]);
+    *az = (int16_t)((buf[4] << 8) | buf[5]);
 }
 
-static void hid_mouse_button(bool pressed) {
-    if (!tud_hid_ready()) return;
-    uint8_t buttons = pressed ? MOUSE_BUTTON_LEFT : 0;
-    tud_hid_mouse_report(0, buttons, 0, 0, 0, 0);
+/* Lê giroscópio bruto (registradores 0x43–0x48) */
+static void mpu_read_gyro(int16_t *gx, int16_t *gy, int16_t *gz) {
+    uint8_t buf[6];
+    mpu_read(0x43, buf, 6);
+    *gx = (int16_t)((buf[0] << 8) | buf[1]);
+    *gy = (int16_t)((buf[2] << 8) | buf[3]);
+    *gz = (int16_t)((buf[4] << 8) | buf[5]);
 }
 
-static void hid_key_action(uint8_t keycode, bool pressed) {
-    if (!tud_hid_ready()) return;
-    if (pressed) {
-        uint8_t keycodes[6] = {keycode, 0, 0, 0, 0, 0};
-        tud_hid_keyboard_report(1, 0, keycodes);
-    } else {
-        uint8_t keycodes[6] = {0, 0, 0, 0, 0, 0};
-        tud_hid_keyboard_report(1, 0, keycodes);
-    }
-}
-
-/* ── ISR CALLBACK (Rule 3.0-3.3, Rule 4.1) ─────────────────
- * ISR minima: apenas captura o pino, estado e timestamp.
- * SEM global de debounce — o timestamp vai no evento para a task.
- * Rule 4.1: usa FromISR em todas as chamadas RTOS.
- * ─────────────────────────────────────────────────────────── */
+/* ── Callback de botões (ISR) ───────────────────────────────────────────── */
 static void btn_callback(uint gpio, uint32_t events) {
+    /* Tenta tomar 1 token de rate-limit; descarta evento se cheio */
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-
-    /* Rate limiting via semaforo — Rule 4.1 */
-    if (xSemaphoreTakeFromISR(rate_sem, &xHigherPriorityTaskWoken) == pdFALSE) {
+    if (xSemaphoreTakeFromISR(xSemRate, &xHigherPriorityTaskWoken) != pdTRUE)
         return;
-    }
 
-    button_event_t event;
-    event.pin     = (uint8_t)gpio;
-    event.state   = (events & GPIO_IRQ_EDGE_FALL) ? 1U : 0U;
-    event.time_ms = to_ms_since_boot(get_absolute_time());
-
-    xQueueSendFromISR(qButtonEvents, &event, &xHigherPriorityTaskWoken);
+    btn_event_t ev = {
+        .pin     = (uint8_t)gpio,
+        .pressed = !(gpio_get(gpio)),   /* pull-up: 0 = pressionado */
+        .ts_ms   = to_ms_since_boot(get_absolute_time()),
+    };
+    xQueueSendFromISR(xQueueButtons, &ev, &xHigherPriorityTaskWoken);
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
-/* ── TASK: USB polling ──────────────────────────────────────── */
-static void usb_task(void *pvParameters) {
-    (void)pvParameters;
-    while (1) {
-        tud_task();
-        vTaskDelay(pdMS_TO_TICKS(1));
+/* ── Utilitário: enfileira string na TX ─────────────────────────────────── */
+static void tx_send(const char *s) {
+    while (*s) {
+        xQueueSend(xQueueTX, s, portMAX_DELAY);
+        s++;
     }
 }
 
-/* ── TASK: Recarrega semaforo de rate limit a cada 1s ──────── */
-static void rate_reset_task(void *pvParameters) {
-    (void)pvParameters;
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(RATE_LIMIT_PERIOD_MS));
-        for (int i = 0; i < MAX_BTN_EVENTS_PER_S; i++) {
-            xSemaphoreGive(rate_sem);
-        }
-    }
-}
+/* ────────────────────────────────────────────────────────────────────────── *
+ *  TASKS
+ * ────────────────────────────────────────────────────────────────────────── */
 
-/* ── TASK: IMU → movimento de mouse ────────────────────────── */
-static void imu_task(void *pvParameters) {
-    (void)pvParameters;
-
+/* init_task: configura hardware e calibra IMU, depois se auto-deleta */
+static void init_task(void *params) {
+    /* I2C */
     i2c_init(I2C_PORT, 400 * 1000);
-    gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_I2C);
-    gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
-    gpio_pull_up(I2C_SDA_PIN);
-    gpio_pull_up(I2C_SCL_PIN);
-    mpu6050_init();
+    gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
+    gpio_set_function(I2C_SCL, GPIO_FUNC_I2C);
+    gpio_pull_up(I2C_SDA);
+    gpio_pull_up(I2C_SCL);
 
-    /* Calibracao (igual ao Enzo) */
-    int32_t gyro_x_offset = 0;
-    int32_t gyro_y_offset = 0;
-    int16_t gyro[3];
+    mpu_init();
 
-    for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
-        mpu6050_read_gyro(gyro);
-        gyro_x_offset += gyro[0];
-        gyro_y_offset += gyro[1];
-        vTaskDelay(pdMS_TO_TICKS(2));
+    /* Verifica WHO_AM_I */
+    uint8_t who = 0;
+    mpu_read(0x75, &who, 1);
+    printf("[INIT] MPU6050 WHO_AM_I=0x%02X %s\n", who, who == 0x68 ? "OK" : "ERRO");
+
+    /* Calibração do giroscópio */
+    printf("[INIT] Calibrando giroscópio — mantenha parado...\n");
+    int32_t sx = 0, sy = 0, sz = 0;
+    for (int i = 0; i < CALIB_SAMPLES; i++) {
+        int16_t gx, gy, gz;
+        mpu_read_gyro(&gx, &gy, &gz);
+        sx += gx; sy += gy; sz += gz;
+        if (i % 20 == 0)
+            gpio_put(LED_CALIBRADO, !gpio_get(LED_CALIBRADO));
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
-    gyro_x_offset /= CALIBRATION_SAMPLES;
-    gyro_y_offset /= CALIBRATION_SAMPLES;
+    gyro_off_x = sx / CALIB_SAMPLES;
+    gyro_off_y = sy / CALIB_SAMPLES;
+    gyro_off_z = sz / CALIB_SAMPLES;
+    gpio_put(LED_CALIBRADO, 1);
+    printf("[INIT] Offsets: gx=%d gy=%d gz=%d\n",
+           (int)gyro_off_x, (int)gyro_off_y, (int)gyro_off_z);
 
-    bool controller_on = false;
-    power_event_t pwr_event;
+    vTaskDelete(NULL);
+}
 
-    while (1) {
-        if (xQueueReceive(qPowerEvents, &pwr_event, 0) == pdPASS) {
-            controller_on = (pwr_event == PWR_ON);
-        }
-
-        if (!controller_on) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-
-        mpu6050_read_gyro(gyro);
-
-        int16_t corrected_gx = gyro[0] - (int16_t)gyro_x_offset;
-        int16_t corrected_gy = gyro[1] - (int16_t)gyro_y_offset;
-
-        int16_t mouse_dx = -corrected_gy / 100;
-        int16_t mouse_dy = -corrected_gx / 100;
-
-        if (abs(corrected_gy) < GYRO_DEADZONE) mouse_dx = 0;
-        if (abs(corrected_gx) < GYRO_DEADZONE) mouse_dy = 0;
-
-        if (mouse_dx >  MAX_MOUSE_SPEED) mouse_dx =  MAX_MOUSE_SPEED;
-        if (mouse_dx < -MAX_MOUSE_SPEED) mouse_dx = -MAX_MOUSE_SPEED;
-        if (mouse_dy >  MAX_MOUSE_SPEED) mouse_dy =  MAX_MOUSE_SPEED;
-        if (mouse_dy < -MAX_MOUSE_SPEED) mouse_dy = -MAX_MOUSE_SPEED;
-
-        if (mouse_dx != 0 || mouse_dy != 0) {
-            if (xSemaphoreTake(hid_mutex, portMAX_DELAY) == pdTRUE) {
-                hid_mouse_move((int8_t)mouse_dx, (int8_t)-mouse_dy);
-                xSemaphoreGive(hid_mutex);
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(10));
+/* tx_task: drena xQueueTX e escreve byte a byte na USB-UART */
+static void tx_task(void *params) {
+    char c;
+    while (true) {
+        xQueueReceive(xQueueTX, &c, portMAX_DELAY);
+        putchar_raw(c);
     }
 }
 
-/* ── TASK: Botoes → HID ─────────────────────────────────────
- * Debounce feito aqui (Rule 4.4): nenhuma global necessaria.
- * last_event_ms[] e local desta task, indexado por pin_to_idx.
- * ─────────────────────────────────────────────────────────── */
-static void btn_task(void *pvParameters) {
-    (void)pvParameters;
+/* power_task: polling do botão POWER; controla LED de status */
+static void power_task(void *params) {
+    bool ligado      = false;
+    bool last_state  = true;   /* pull-up: true = solto */
+    char msg[16];
 
-    const uint8_t BTN_PINS[NUM_BTNS] = {
-        BTN_APPROVE_PIN, BTN_DENY_PIN,
-        BTN_CLICK_PIN,   BTN_INSPECT_PIN
-    };
+    while (true) {
+        bool cur = gpio_get(BTN_POWER);
 
-    for (int i = 0; i < NUM_BTNS; i++) {
-        gpio_init(BTN_PINS[i]);
-        gpio_set_dir(BTN_PINS[i], GPIO_IN);
-        gpio_pull_up(BTN_PINS[i]);
-        gpio_set_irq_enabled_with_callback(
-            BTN_PINS[i],
-            GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE,
-            true, &btn_callback
-        );
-    }
+        if (!cur && last_state) {          /* borda de descida = pressionado */
+            ligado = !ligado;
+            gpio_put(LED_STATUS, ligado);
 
-    /* Timestamps de debounce locais — sem global, Rule 4.4 */
-    uint32_t last_event_ms[NUM_BTNS] = {0U, 0U, 0U, 0U};
+            snprintf(msg, sizeof(msg), "PWR,%d\n", ligado ? 1 : 0);
+            tx_send(msg);
+            printf("[POWER] Controle %s\n", ligado ? "LIGADO" : "DESLIGADO");
 
-    bool controller_on = false;
-    button_event_t ev;
-    power_event_t pwr_event;
+            /* notifica imu_task, btn_task e ia_task via fila (1 slot, overwrite) */
+            xQueueOverwrite(xQueuePower, &ligado);
 
-    while (1) {
-        if (xQueueReceive(qPowerEvents, &pwr_event, 0) == pdPASS) {
-            controller_on = (pwr_event == PWR_ON);
+            vTaskDelay(pdMS_TO_TICKS(50));   /* debounce simples */
         }
-
-        if (xQueueReceive(qButtonEvents, &ev, pdMS_TO_TICKS(10)) != pdPASS) {
-            continue;
-        }
-
-        /* Debounce na task: descarta se muito recente */
-        int idx = pin_to_idx(ev.pin);
-        if (idx < 0) continue;
-        if ((ev.time_ms - last_event_ms[idx]) < DEBOUNCE_MS) continue;
-        last_event_ms[idx] = ev.time_ms;
-
-        if (!controller_on) continue;
-
-        bool pressed = (ev.state == 1U);
-
-        if (xSemaphoreTake(hid_mutex, portMAX_DELAY) == pdTRUE) {
-            switch (ev.pin) {
-                case BTN_APPROVE_PIN:
-                    hid_key_action(HID_KEY_A, pressed);
-                    break;
-                case BTN_DENY_PIN:
-                    hid_key_action(HID_KEY_X, pressed);
-                    break;
-                case BTN_CLICK_PIN:
-                    hid_mouse_button(pressed);
-                    break;
-                case BTN_INSPECT_PIN:
-                    hid_key_action(HID_KEY_I, pressed);
-                    break;
-                default:
-                    break;
-            }
-            xSemaphoreGive(hid_mutex);
-        }
-    }
-}
-
-/* ── TASK: Power + LED ──────────────────────────────────────── */
-static void power_task(void *pvParameters) {
-    (void)pvParameters;
-
-    gpio_init(BTN_POWER_PIN);
-    gpio_set_dir(BTN_POWER_PIN, GPIO_IN);
-    gpio_pull_up(BTN_POWER_PIN);
-
-    gpio_init(LED_STATUS_PIN);
-    gpio_set_dir(LED_STATUS_PIN, GPIO_OUT);
-    gpio_put(LED_STATUS_PIN, 0);
-
-    bool last_btn_state = true;
-    bool controller_on  = false;
-    TickType_t last_press = 0;
-
-    while (1) {
-        bool current = gpio_get(BTN_POWER_PIN);
-
-        if (!current && last_btn_state) {
-            TickType_t now = xTaskGetTickCount();
-            if ((now - last_press) > pdMS_TO_TICKS(300)) {
-                controller_on = !controller_on;
-                gpio_put(LED_STATUS_PIN, controller_on ? 1 : 0);
-
-                power_event_t pwr = controller_on ? PWR_ON : PWR_OFF;
-                xQueueOverwrite(qPowerEvents, &pwr);
-
-                last_press = now;
-            }
-        }
-        last_btn_state = current;
-
+        last_state = cur;
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
-/* ── MAIN ───────────────────────────────────────────────────── */
+/* rate_reset_task: recarrega xSemRate a 1 Hz (permite RATE_LIMIT_HZ eventos/s) */
+static void rate_reset_task(void *params) {
+    while (true) {
+        for (int i = 0; i < RATE_LIMIT_HZ; i++)
+            xSemaphoreGive(xSemRate);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+/* imu_task: lê MPU6050 ~100 Hz; envia M,dx,dy pela UART e amostras p/ ia_task */
+static void imu_task(void *params) {
+    bool ligado = false;
+    char msg[32];
+
+    /* Aguarda init_task terminar a calibração (espera LED_CALIBRADO acender) */
+    while (!gpio_get(LED_CALIBRADO))
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+    /* Buffer circular de amostras para a janela da IA */
+    static imu_sample_t ia_buf[IA_WINDOW_SIZE];
+    int ia_idx = 0;
+
+    const TickType_t period = pdMS_TO_TICKS(10);   /* 100 Hz */
+    TickType_t last_wake = xTaskGetTickCount();
+
+    while (true) {
+        vTaskDelayUntil(&last_wake, period);
+
+        /* Verifica estado do controle (non-blocking) */
+        xQueuePeek(xQueuePower, &ligado, 0);
+        if (!ligado) continue;
+
+        /* Lê giroscópio → movimento do cursor */
+        int16_t gx, gy, gz;
+        mpu_read_gyro(&gx, &gy, &gz);
+
+        int dx = (gx - gyro_off_x) / (32768 / MOUSE_SCALE);
+        int dy = (gy - gyro_off_y) / (32768 / MOUSE_SCALE);
+
+        /* Clamp */
+        if (dx >  MOUSE_CLAMP) dx =  MOUSE_CLAMP;
+        if (dx < -MOUSE_CLAMP) dx = -MOUSE_CLAMP;
+        if (dy >  MOUSE_CLAMP) dy =  MOUSE_CLAMP;
+        if (dy < -MOUSE_CLAMP) dy = -MOUSE_CLAMP;
+
+        if (dx != 0 || dy != 0) {
+            snprintf(msg, sizeof(msg), "M,%d,%d\n", dx, dy);
+            tx_send(msg);
+        }
+
+        /* Lê aceleração → alimenta janela da IA */
+        int16_t ax, ay, az;
+        mpu_read_accel(&ax, &ay, &az);
+
+        /* Converte para g (escala ±2g: 16384 LSB/g) */
+        ia_buf[ia_idx].ax = ax / 16384.0f;
+        ia_buf[ia_idx].ay = ay / 16384.0f;
+        ia_buf[ia_idx].az = az / 16384.0f;
+        ia_idx = (ia_idx + 1) % IA_WINDOW_SIZE;
+
+        /* Quando completar uma janela, envia cópia para ia_task */
+        if (ia_idx == 0) {
+            static imu_sample_t snap[IA_WINDOW_SIZE];
+            memcpy(snap, ia_buf, sizeof(ia_buf));
+            /* Não bloqueia: descarta se ia_task ainda estiver ocupada */
+            xQueueSend(xQueueIMU, &snap, 0);
+        }
+    }
+}
+
+/* btn_task: debounce dos botões de ação; enfileira BD/BU,n na UART */
+static void btn_task(void *params) {
+    /* Mapeamento pino → índice de botão (1-based, conforme protocolo) */
+    const uint8_t btn_pins[4]    = {BTN_APPROVE, BTN_DENY, BTN_CLICK, BTN_INSPECT};
+    const char   *btn_names[4]   = {"APPROVE",   "DENY",   "CLICK",   "INSPECT"};
+
+    bool ligado = false;
+    btn_event_t ev;
+    char msg[16];
+
+    /* Timestamps do último evento por pino (debounce) */
+    uint32_t last_ts[4] = {0, 0, 0, 0};
+    const uint32_t DEBOUNCE_MS = 50;
+
+    while (true) {
+        if (xQueueReceive(xQueueButtons, &ev, portMAX_DELAY) != pdTRUE)
+            continue;
+
+        xQueuePeek(xQueuePower, &ligado, 0);
+        if (!ligado) continue;
+
+        /* Encontra índice */
+        int idx = -1;
+        for (int i = 0; i < 4; i++) {
+            if (btn_pins[i] == ev.pin) { idx = i; break; }
+        }
+        if (idx < 0) continue;
+
+        /* Debounce por timestamp */
+        if (ev.ts_ms - last_ts[idx] < DEBOUNCE_MS) continue;
+        last_ts[idx] = ev.ts_ms;
+
+        snprintf(msg, sizeof(msg), "%s,%d\n",
+                 ev.pressed ? "BD" : "BU", idx + 1);
+        tx_send(msg);
+        printf("[BTN] %s %s\n", btn_names[idx], ev.pressed ? "DOWN" : "UP");
+    }
+}
+
+/* ia_task: inferência Edge Impulse sobre janelas de aceleração da IMU */
+static void ia_task(void *params) {
+    /* Buffer de entrada para o classificador: IA_WINDOW_SIZE × IA_N_AXES */
+    static imu_sample_t window[IA_WINDOW_SIZE];
+    bool ligado = false;
+
+    while (true) {
+        if (xQueueReceive(xQueueIMU, &window, portMAX_DELAY) != pdTRUE)
+            continue;
+
+        xQueuePeek(xQueuePower, &ligado, 0);
+        if (!ligado) continue;
+
+#if IA_ENABLED
+        /* ── Inferência via Edge Impulse ───────────────────────────────────
+         * Monta o sinal no formato esperado pelo impulse.
+         * O Edge Impulse espera um array flat: [ax0,ay0,az0, ax1,ay1,az1, ...]
+         * ------------------------------------------------------------------ */
+        static float features[IA_WINDOW_SIZE * IA_N_AXES];
+        for (int i = 0; i < IA_WINDOW_SIZE; i++) {
+            features[i * IA_N_AXES + 0] = window[i].ax;
+            features[i * IA_N_AXES + 1] = window[i].ay;
+            features[i * IA_N_AXES + 2] = window[i].az;
+        }
+
+        signal_t signal;
+        numpy::signal_from_buffer(features, IA_WINDOW_SIZE * IA_N_AXES, &signal);
+
+        ei_impulse_result_t result;
+        EI_IMPULSE_ERROR err = run_classifier(&signal, &result, false);
+
+        if (err != EI_IMPULSE_OK) {
+            printf("[IA] Erro na inferência: %d\n", err);
+            continue;
+        }
+
+        /* Encontra classe vencedora */
+        int    best_idx   = 0;
+        float  best_score = 0.0f;
+        for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+            if (result.classification[i].value > best_score) {
+                best_score = result.classification[i].value;
+                best_idx   = (int)i;
+            }
+        }
+
+        const char *label = result.classification[best_idx].label;
+        printf("[IA] %s (%.2f)\n", label, best_score);
+
+        /* LED feedback: acende LED correspondente à classe */
+        gpio_put(LED_IA_IDLE,   strcmp(label, "idle")   == 0);
+        gpio_put(LED_IA_UPDOWN, strcmp(label, "updown") == 0);
+        gpio_put(LED_IA_WAVE,   strcmp(label, "wave")   == 0);
+
+#else
+        /* IA_ENABLED == 0: apenas imprime amostra para debug */
+        printf("[IA] stub — janela recebida (ax=%.2f ay=%.2f az=%.2f)\n",
+               window[0].ax, window[0].ay, window[0].az);
+#endif
+    }
+}
+
+/* ── main ───────────────────────────────────────────────────────────────── */
 int main(void) {
-    board_init();
-    tusb_init();
     stdio_init_all();
+    sleep_ms(2000);   /* aguarda USB-CDC conectar */
 
-    qButtonEvents = xQueueCreate(20, sizeof(button_event_t));
-    qPowerEvents  = xQueueCreate(1,  sizeof(power_event_t));
-    hid_mutex     = xSemaphoreCreateMutex();
-    rate_sem      = xSemaphoreCreateCounting(MAX_BTN_EVENTS_PER_S,
-                                              MAX_BTN_EVENTS_PER_S);
+    printf("\n=== Controle Papers, Please — APS2 ===\n");
 
-    xTaskCreate(usb_task,        "USBTask",      256, NULL, 3, NULL);
-    xTaskCreate(imu_task,        "IMUTask",      512, NULL, 1, NULL);
-    xTaskCreate(btn_task,        "BtnTask",      256, NULL, 1, NULL);
-    xTaskCreate(power_task,      "PwrTask",      256, NULL, 2, NULL);
-    xTaskCreate(rate_reset_task, "RateRstTask",  128, NULL, 2, NULL);
+    /* Configura botões de ação com IRQ */
+    const uint action_btns[] = {BTN_APPROVE, BTN_DENY, BTN_CLICK, BTN_INSPECT};
+    for (int i = 0; i < 4; i++) {
+        gpio_init(action_btns[i]);
+        gpio_set_dir(action_btns[i], GPIO_IN);
+        gpio_pull_up(action_btns[i]);
+        gpio_set_irq_enabled_with_callback(action_btns[i],
+            GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, btn_callback);
+    }
+
+    /* Botão POWER (polling na power_task) */
+    gpio_init(BTN_POWER);
+    gpio_set_dir(BTN_POWER, GPIO_IN);
+    gpio_pull_up(BTN_POWER);
+
+    /* LEDs */
+    const uint leds[] = {LED_STATUS, LED_CALIBRADO, LED_IA_IDLE, LED_IA_UPDOWN, LED_IA_WAVE};
+    for (int i = 0; i < 5; i++) {
+        gpio_init(leds[i]);
+        gpio_set_dir(leds[i], GPIO_OUT);
+        gpio_put(leds[i], 0);
+    }
+
+    /* Filas e semáforos */
+    xQueueButtons = xQueueCreate(16, sizeof(btn_event_t));
+    xQueueTX      = xQueueCreate(256, sizeof(char));
+    xQueuePower   = xQueueCreate(1,   sizeof(bool));
+    xQueueIMU     = xQueueCreate(2,   sizeof(imu_sample_t) * IA_WINDOW_SIZE);
+    xSemRate      = xSemaphoreCreateCounting(RATE_LIMIT_HZ, RATE_LIMIT_HZ);
+
+    /* Estado inicial do controle: desligado */
+    bool off = false;
+    xQueueSend(xQueuePower, &off, 0);
+
+    /* Tasks */
+    xTaskCreate(init_task,       "init",       2048, NULL, 4, NULL);
+    xTaskCreate(tx_task,         "tx",         512,  NULL, 3, NULL);
+    xTaskCreate(power_task,      "power",      512,  NULL, 2, NULL);
+    xTaskCreate(rate_reset_task, "rate_reset", 256,  NULL, 2, NULL);
+    xTaskCreate(imu_task,        "imu",        1024, NULL, 1, NULL);
+    xTaskCreate(ia_task,         "ia",         4096, NULL, 1, NULL);
+    xTaskCreate(btn_task,        "btn",        512,  NULL, 1, NULL);
 
     vTaskStartScheduler();
-    while (1);
-}
 
-/* ── CALLBACKS TINYUSB ──────────────────────────────────────
- * Sem "static": TinyUSB chama via weak symbol, precisa de
- * linkagem externa para o linker resolver corretamente.
- * Sem "static" o cppcheck nao acusa unusedFunction.
- * ─────────────────────────────────────────────────────────── */
-uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
-                                hid_report_type_t report_type,
-                                uint8_t *buffer, uint16_t reqlen) {
-    (void)instance; (void)report_id; (void)report_type;
-    (void)buffer;   (void)reqlen;
+    /* Nunca deve chegar aqui */
+    while (true) {}
     return 0;
-}
-
-void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
-                            hid_report_type_t report_type,
-                            uint8_t const *buffer, uint16_t bufsize) {
-    (void)instance; (void)report_id; (void)report_type;
-    (void)buffer;   (void)bufsize;
 }
